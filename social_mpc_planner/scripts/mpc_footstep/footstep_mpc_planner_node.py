@@ -14,6 +14,7 @@ from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from geometry_msgs.msg import Point
 from social_mpc_planner.msg import CircularObstacleArray
 from social_mpc_planner.msg import PredictedPeople
+from social_mpc_planner.msg import PredictedPeopleUncertainty
 from gait_planner.srv import Trajectory, TrajectoryRequest
 from std_msgs.msg import Float32, Int32, Bool, String
 
@@ -85,6 +86,11 @@ class FootstepMPCPlanner:
         self.goal_sub = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.goal_callback)
 
         self.marker_pub = rospy.Publisher("/footstep_markers", MarkerArray, queue_size=10)
+        self.chance_direction_marker_pub = rospy.Publisher(
+            "/chance_direction_markers",
+            MarkerArray,
+            queue_size=10
+        )
 
         # Publish the optimized/generated footsteps in the global odom frame so
         # the experiment logger can store them for offline plots and videos.
@@ -110,9 +116,10 @@ class FootstepMPCPlanner:
 
         rospy.loginfo("footstep_mpc_planner_node started.")
 
-        self.walk_config_path = os.path.expanduser(
-            "~/Surena_ws/src/surenaV_core/gait_planner/config/walk_config.json"
-        )
+        self.walk_config_path = (
+    "/home/linux/mpc_planner/src/MPC-based-Footstep-Planning/"
+    "gait_planner/config/walk_config.json"
+)
 
         self.step_width_config = 0.10
         self.default_walk_config = {
@@ -128,6 +135,21 @@ class FootstepMPCPlanner:
 
         self.step_time = 1.0
         self.human_prediction_dt = 0.5
+
+        # Fixed per-human/per-footstep risk level for the first chance-constraint
+        # implementation. Global risk allocation will be added later.
+        self.chance_epsilon = 0.05
+        self.chance_beta = 1.6448536269514722
+        self.chance_robot_radius = 0.20
+        self.use_dummy_human_covariance = True
+        self.dummy_sigma_x = 0.20
+        self.dummy_sigma_y = 0.10
+        self.dummy_rho = 0.0
+
+        # Absolute human-position covariance sequences received from the predictor.
+        # Their correctness and calibration will be handled in a later version.
+        self.predicted_people_covariance = {}
+        self.human_uncertainty_dt = 0.5
 
         self.max_people = 3
 
@@ -171,6 +193,11 @@ class FootstepMPCPlanner:
             PredictedPeople,
             self.predicted_people_callback
         )
+        self.predicted_people_uncertainty_sub = rospy.Subscriber(
+            "/predicted_people_uncertainty",
+            PredictedPeopleUncertainty,
+            self.predicted_people_uncertainty_callback
+        )
         rospy.loginfo("MPC dynamic obstacle prediction topic: %s", self.predicted_people_topic)
 
         # Adaptive MPC horizon parameters
@@ -191,10 +218,10 @@ class FootstepMPCPlanner:
         # Stagnation mode:
         #   temporarily execute a longer batch to escape narrow passages or
         #   local repeated replanning behavior.
-        self.min_execution_steps = 10
-        self.preferred_execution_steps = 10
+        self.min_execution_steps = 6
+        self.preferred_execution_steps = 6
         self.stagnation_execution_steps = 6
-        self.max_execution_steps = 10
+        self.max_execution_steps = 6
         self.execution_steps = self.preferred_execution_steps
 
         # Stagnation detection parameters. Progress is measured as the
@@ -469,6 +496,26 @@ class FootstepMPCPlanner:
 
         self.predicted_people = people
 
+    def predicted_people_uncertainty_callback(self, msg):
+        """Store absolute-position covariance samples indexed by person ID."""
+        if msg.dt > 1e-6:
+            self.human_uncertainty_dt = msg.dt
+
+        for person in msg.people:
+            covariance_sequence = []
+
+            for sigma_x, sigma_y, rho in zip(person.sigma_x, person.sigma_y, person.rho):
+                sigma_x = max(0.0, float(sigma_x))
+                sigma_y = max(0.0, float(sigma_y))
+                rho = max(-0.999, min(0.999, float(rho)))
+
+                sigma_xx = sigma_x * sigma_x
+                sigma_xy = rho * sigma_x * sigma_y
+                sigma_yy = sigma_y * sigma_y
+                covariance_sequence.append((sigma_xx, sigma_xy, sigma_yy))
+
+            self.predicted_people_covariance[person.id] = covariance_sequence
+
 
     def plan_footsteps(self):
         if self.is_walking:
@@ -498,12 +545,12 @@ class FootstepMPCPlanner:
         self.execution_horizon_pub.publish(Int32(self.execution_steps))
         self.planner_status_pub.publish(String("planning"))
 
-        if self.enable_dynamic_obstacles and self.enable_human_uncertainty_margin:
+        if self.enable_dynamic_obstacles:
             rospy.loginfo(
-                "Human prediction uncertainty margin | first=%.3f m | last=%.3f m | max=%.3f m",
-                self.human_uncertainty_margin_at_step(0),
-                self.human_uncertainty_margin_at_step(max(0, self.N - 1)),
-                self.human_uncertainty_max_margin
+                "Human chance constraints | epsilon=%.3f | beta=%.6f | robot radius=%.3f m",
+                self.chance_epsilon,
+                self.chance_beta,
+                self.chance_robot_radius
             )
 
         N = self.N
@@ -519,6 +566,27 @@ class FootstepMPCPlanner:
         # Desired final heading expressed in the local MPC frame.
         # This is the actual goal orientation from PoseStamped, not only the direction to the goal point.
         goal_theta_final_l = self.wrap_angle(self.gtheta - th_start)
+
+        # Heading of the line from the current robot pose to the goal position.
+        # This is used as a weak intermediate reference so the robot generally faces the path.
+        goal_theta_path = math.atan2(gy_l, gx_l)
+
+        # Fixed nominal footsteps define each chance constraint's separating
+        # direction and are reused as the IPOPT initial guess. Thus n remains
+        # constant throughout one MPC solve and never depends on X or Y.
+        nominal_footsteps = []
+        for k in range(N):
+            alpha = float(k + 1) / float(N)
+            is_left = self.next_foot_is_left if k % 2 == 0 else not self.next_foot_is_left
+            lateral = self.step_width if is_left else -self.step_width
+            x_ref = alpha * gx_l
+            y_ref = alpha * gy_l
+            yaw_nom = self.wrap_angle(
+                (1.0 - alpha) * goal_theta_path + alpha * goal_theta_final_l
+            )
+            x_nom = x_ref - lateral * math.sin(yaw_nom)
+            y_nom = y_ref + lateral * math.cos(yaw_nom)
+            nominal_footsteps.append((x_nom, y_nom, yaw_nom))
 
         # Select only the nearest static obstacles to the current robot pose.
         # This avoids adding hundreds of circular-obstacle constraints to the MPC.
@@ -539,10 +607,15 @@ class FootstepMPCPlanner:
         if self.enable_dynamic_obstacles:
             for person in self.predicted_people[:self.max_people]:
                 traj_l = []
+                cov_l = []
                 traj = person["trajectory"]
+                covariance_sequence = self.predicted_people_covariance.get(person["id"], [])
+
+                cos_start = math.cos(th_start)
+                sin_start = math.sin(th_start)
 
                 for k in range(N):
-                    t_k = k * self.step_time
+                    t_k = (k + 1) * self.step_time
                     human_index = int(round(t_k / self.human_prediction_dt))
 
                     if human_index >= len(traj):
@@ -557,12 +630,38 @@ class FootstepMPCPlanner:
 
                     traj_l.append((hx_l, hy_l))
 
+                    if covariance_sequence:
+                        cov_index = int(round(t_k / self.human_uncertainty_dt))
+                        cov_index = max(0, min(cov_index, len(covariance_sequence) - 1))
+                        sigma_xx, sigma_xy, sigma_yy = covariance_sequence[cov_index]
+
+                        # Rotate absolute world-frame covariance with the same
+                        # world-to-local rotation used for the human mean.
+                        sigma_xx_l = (
+                            cos_start * cos_start * sigma_xx
+                            + 2.0 * cos_start * sin_start * sigma_xy
+                            + sin_start * sin_start * sigma_yy
+                        )
+                        sigma_xy_l = (
+                            cos_start * sin_start * (sigma_yy - sigma_xx)
+                            + (cos_start * cos_start - sin_start * sin_start) * sigma_xy
+                        )
+                        sigma_yy_l = (
+                            sin_start * sin_start * sigma_xx
+                            - 2.0 * cos_start * sin_start * sigma_xy
+                            + cos_start * cos_start * sigma_yy
+                        )
+                        cov_l.append((sigma_xx_l, sigma_xy_l, sigma_yy_l))
+                    else:
+                        cov_l.append((0.0, 0.0, 0.0))
+
 
 
                 local_people.append({
                     "id": person["id"],
                     "radius": person["radius"],
-                    "trajectory": traj_l
+                    "trajectory": traj_l,
+                    "covariance": cov_l
                 })
 
         opti = ca.Opti()
@@ -572,20 +671,13 @@ class FootstepMPCPlanner:
         TH = opti.variable(N)
         num_obs = len(local_obstacles)
         S_obs = opti.variable(num_obs, N) if num_obs > 0 else None
-        if self.enable_dynamic_obstacles:
-            S_human = opti.variable(self.max_people, N)
-        else:
-            S_human = None
 
         cost = 0.0
 
         prev_x = 0.0
         prev_y = 0.0
         prev_th = 0.0
-
-        # Heading of the line from the current robot pose to the goal position.
-        # This is used as a weak intermediate reference so the robot generally faces the path.
-        goal_theta_path = math.atan2(gy_l, gx_l)
+        chance_direction_debug = []
 
         for k in range(N):
             xk = X[k]
@@ -649,7 +741,7 @@ class FootstepMPCPlanner:
 
 
 
-            human_constraint_horizon = N
+            human_constraint_horizon = 6
 
             if self.enable_dynamic_obstacles and k < human_constraint_horizon:
                 for h, person in enumerate(local_people):
@@ -661,20 +753,61 @@ class FootstepMPCPlanner:
 
                     hx, hy = human_state
                     hr = person["radius"]
-                    
 
-                    uncertainty_margin = self.human_uncertainty_margin_at_step(k)
-                    safe_dist = hr + self.human_safety_margin + self.foot_radius + uncertainty_margin
+                    if self.use_dummy_human_covariance:
+                        sigma_xx = self.dummy_sigma_x ** 2
+                        sigma_yy = self.dummy_sigma_y ** 2
+                        sigma_xy = (
+                            self.dummy_rho
+                            * self.dummy_sigma_x
+                            * self.dummy_sigma_y
+                        )
+                    else:
+                        sigma_xx, sigma_xy, sigma_yy = person["covariance"][k]
+                    x_nom, y_nom, _ = nominal_footsteps[k]
 
-                    dx_h = xk - hx
-                    dy_h = yk - hy
+                    dx_nom = x_nom - hx
+                    dy_nom = y_nom - hy
+                    norm_nom = math.hypot(dx_nom, dy_nom)
 
-                    dist_sq_h = dx_h * dx_h + dy_h * dy_h
+                    if norm_nom > 1e-6:
+                        nx = dx_nom / norm_nom
+                        ny = dy_nom / norm_nom
+                    else:
+                        nx = math.cos(goal_theta_path)
+                        ny = math.sin(goal_theta_path)
 
-                    opti.subject_to(S_human[h, k] >= 0.0)
-                    opti.subject_to(dist_sq_h + S_human[h, k] >= safe_dist * safe_dist)
+                    if k == 0:
+                        chance_direction_debug.append({
+                            "human_id": person["id"],
+                            "hx": hx,
+                            "hy": hy,
+                            "x_nom": x_nom,
+                            "y_nom": y_nom,
+                            "nx": nx,
+                            "ny": ny,
+                        })
 
-                    cost += self.W_human_slack * S_human[h, k] * S_human[h, k]
+                    # Conservative fixed-halfspace approximation of the circular
+                    # Gaussian collision chance constraint (not an exact
+                    # reformulation). The directional variance is n^T Sigma n.
+                    sigma_n_sq = (
+                        nx * nx * sigma_xx
+                        + 2.0 * nx * ny * sigma_xy
+                        + ny * ny * sigma_yy
+                    )
+                    sigma_n = math.sqrt(max(0.0, sigma_n_sq))
+                    collision_radius = self.chance_robot_radius + hr
+                    required_separation = (
+                        collision_radius
+                        + self.chance_beta * sigma_n
+                    )
+
+                    opti.subject_to(
+                        nx * (xk - hx)
+                        + ny * (yk - hy)
+                        >= required_separation
+                    )
 
             # yaw constraint
             dtheta = self.normalize_angle_expr(thk - prev_th)
@@ -700,6 +833,8 @@ class FootstepMPCPlanner:
             prev_y = yk
             prev_th = thk
 
+        self.publish_chance_direction_markers(chance_direction_debug)
+
         terminal_position_cost = (X[N - 1] - gx_l) ** 2 + (Y[N - 1] - gy_l) ** 2
         terminal_yaw_error = self.normalize_angle_expr(TH[N - 1] - goal_theta_final_l)
 
@@ -711,19 +846,7 @@ class FootstepMPCPlanner:
         opti.minimize(cost)
 
         for k in range(N):
-            alpha = float(k + 1) / float(N)
-
-            is_left = self.next_foot_is_left if k % 2 == 0 else not self.next_foot_is_left
-            lateral = self.step_width if is_left else -self.step_width
-
-            x_ref = alpha * gx_l
-            y_ref = alpha * gy_l
-
-            # Initialize the yaw smoothly from the path-facing direction toward the desired final heading.
-            yaw_init = self.wrap_angle((1.0 - alpha) * goal_theta_path + alpha * goal_theta_final_l)
-
-            x_init = x_ref - lateral * math.sin(yaw_init)
-            y_init = y_ref + lateral * math.cos(yaw_init)
+            x_init, y_init, yaw_init = nominal_footsteps[k]
 
             opti.set_initial(X[k], x_init)
             opti.set_initial(Y[k], y_init)
@@ -739,8 +862,6 @@ class FootstepMPCPlanner:
         }
 
         opti.solver("ipopt", opts)
-        if self.enable_dynamic_obstacles:
-            opti.set_initial(S_human, 0.1)
 
         try:
             t0 = rospy.Time.now()
@@ -981,6 +1102,112 @@ class FootstepMPCPlanner:
             nearest_clearance,
             self.obstacle_selection_radius
         )
+
+    def publish_chance_direction_markers(self, debug_data):
+        marker_array = MarkerArray()
+
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        marker_array.markers.append(delete_marker)
+
+        now = rospy.Time.now()
+        marker_id = 0
+        arrow_length = 0.5
+
+        for data in debug_data:
+            hx = data["hx"]
+            hy = data["hy"]
+            x_nom = data["x_nom"]
+            y_nom = data["y_nom"]
+            nx = data["nx"]
+            ny = data["ny"]
+
+            # All of the above coordinates are in the MPC local frame.
+            # Convert them back to world/odom coordinates for RViz.
+
+            human_world_x, human_world_y = self.local_to_world(
+                hx, hy, self.x, self.y, self.theta
+            )
+
+            arrow_end_local_x = hx + arrow_length * nx
+            arrow_end_local_y = hy + arrow_length * ny
+
+            arrow_end_world_x, arrow_end_world_y = self.local_to_world(
+                arrow_end_local_x,
+                arrow_end_local_y,
+                self.x,
+                self.y,
+                self.theta
+            )
+
+            nominal_world_x, nominal_world_y = self.local_to_world(
+                x_nom,
+                y_nom,
+                self.x,
+                self.y,
+                self.theta
+            )
+
+            # Arrow showing direction n
+            arrow = Marker()
+            arrow.header.frame_id = "odom"
+            arrow.header.stamp = now
+            arrow.ns = "chance_direction_n"
+            arrow.id = marker_id
+            marker_id += 1
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+
+            start = Point()
+            start.x = human_world_x
+            start.y = human_world_y
+            start.z = 0.25
+
+            end = Point()
+            end.x = arrow_end_world_x
+            end.y = arrow_end_world_y
+            end.z = 0.25
+
+            arrow.points = [start, end]
+
+            arrow.scale.x = 0.03
+            arrow.scale.y = 0.07
+            arrow.scale.z = 0.10
+
+            arrow.color.r = 0.0
+            arrow.color.g = 1.0
+            arrow.color.b = 0.0
+            arrow.color.a = 1.0
+
+            marker_array.markers.append(arrow)
+
+            # Nominal foot position used to construct n
+            nominal_marker = Marker()
+            nominal_marker.header.frame_id = "odom"
+            nominal_marker.header.stamp = now
+            nominal_marker.ns = "chance_nominal_foot"
+            nominal_marker.id = marker_id
+            marker_id += 1
+            nominal_marker.type = Marker.SPHERE
+            nominal_marker.action = Marker.ADD
+
+            nominal_marker.pose.position.x = nominal_world_x
+            nominal_marker.pose.position.y = nominal_world_y
+            nominal_marker.pose.position.z = 0.25
+            nominal_marker.pose.orientation.w = 1.0
+
+            nominal_marker.scale.x = 0.12
+            nominal_marker.scale.y = 0.12
+            nominal_marker.scale.z = 0.12
+
+            nominal_marker.color.r = 1.0
+            nominal_marker.color.g = 0.0
+            nominal_marker.color.b = 1.0
+            nominal_marker.color.a = 1.0
+
+            marker_array.markers.append(nominal_marker)
+
+        self.chance_direction_marker_pub.publish(marker_array)
 
     def publish_generated_footsteps_world(self, footsteps):
         """
